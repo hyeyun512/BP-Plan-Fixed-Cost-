@@ -48,11 +48,31 @@ ENTITIES = {
         langs=["en", "ko"],                                         # HUK만 영문(배포용) + 한글(검토용)
     ),
 }
+
+def _single(ent, cur, ref_glob, chart_end=117, sh_major=None, **kw):
+    """CC를 나누지 않는 법인: 법인 전체 입력 시트 1개. 26BP는 Supabase, 상세 항목은 26년 파일 헤더(8행)로 열 위치를 찾는다."""
+    return dict(cur=cur, ref_glob=ref_glob, divs=None,
+                sh_major=sh_major or f"0.{ent}", major_rows=(4, 43), sh_chart=ent, chart_rows=(4, chart_end),
+                det_src={"29": dict(sheet="Charges", hdr=8), "47": dict(sheet="Promotion&Advertisement", hdr=8)}, **kw)
+
+ENTITIES.update({
+    "HUS": _single("HUS", "USD", "1. HUS_*2026Y_Final.xlsx"),
+    "HMX": _single("HMX", "USD", "2. HMX_*2026Y_Final.xlsx"),      # 26BP USD, 실적 MXN → 월별 USD 실적환율로 환산 (사용자 확정)
+    "HDG": _single("HDG", "EUR", "4. HDG_*2026Y_Final.XLSX", sh_major="0.HDG(EUR)"),
+    "HUG": _single("HUG", "AED", "5. HUG_*2026Y_Final.xlsx", det_from_bp={"29"}),   # 26년 Charges 시트가 26BP와 불일치 → 26BP 계정별 참고 행 (사용자 확정)
+    "HBR": _single("HBR", "BRL", "7. HBR_*2026Y_Final.xlsx", chart_end=133),
+    "HJP": _single("HJP", "JPY", "8. HJP_*2026Y_Final*.xlsx"),
+    "HID": _single("HID", "INR", "11. HID_*2026Y_Final.xlsx"),
+    "HSZ": _single("HSZ", "CNY", "12. HSZ_*2026Y_Final.xlsx"),
+})
 ENT = sys.argv[1] if len(sys.argv) > 1 else "HUK"
 LANGS = ENTITIES[ENT].get("langs", ["ko"]) if ENT in ENTITIES else ["ko"]   # 기본은 한글판만
 OUT_DIR = sys.argv[2] if len(sys.argv) > 2 else ROOT
 E = ENTITIES[ENT]
-CUR, DIVS, CC_DIV, NO_CC_DIV = E["cur"], E["divs"], E["cc_div"], E["no_cc_div"]
+MULTI = bool(E["divs"])                                             # CC별 시트 여부 (HUK만 True)
+CUR = E["cur"]
+DIVS = E["divs"] if MULTI else [ENT]
+CC_DIV, NO_CC_DIV = E.get("cc_div", {}), E.get("no_cc_div", ENT)
 _refs = [f for f in glob.glob(os.path.join(REF_DIR, E["ref_glob"])) if "~$" not in f]
 assert len(_refs) == 1, f"26년 배포 파일을 하나로 특정할 수 없음: {_refs}"
 REF = _refs[0]
@@ -91,16 +111,18 @@ bp = bp[(bp["본사/법인"] == "법인") & (~bp["보고용"].astype(str).str.co
 assert set(bp["통화(Doc)"]) == {CUR}
 bp_gl = bp.groupby(pd.to_numeric(bp["G/L Account"]))["Amount(Doc)"].sum()
 
-act_cat = sb_select(ACT_TABLE, ["gl_account", "category"])                                         # 구분 판정용 전체
+act_cat = sb_select(ACT_TABLE, ["gl_account", "category", "local_currency", "amount_local_curr", "amount_krw", "month"])   # 구분 판정·환율용 전체
 act = sb_select(ACT_TABLE, _ACT_COLS, report_use_re=ENT)
-for c in ("amount_local_curr", "amount_krw"): act[c] = pd.to_numeric(act[c])
+for d in (act, act_cat):
+    for c in ("amount_local_curr", "amount_krw"): d[c] = pd.to_numeric(d[c])
 act = act[(act.hq_corp == "법인") & (~act.report_use.astype(str).str.contains("주재원"))].copy()
 act["gl"] = pd.to_numeric(act.gl_account)
 g = act[act.local_currency == CUR]
-rate = g.groupby("month").amount_krw.sum() / g.groupby("month").amount_local_curr.sum()     # KRW per GBP, monthly
+if g.empty: g = act_cat[act_cat.local_currency == CUR]   # HMX: 현지통화(MXN) ≠ 예산통화(USD) → 전 법인 USD 전표로 환율 산출
+rate = g.groupby("month").amount_krw.sum() / g.groupby("month").amount_local_curr.sum()     # KRW per CUR, monthly
 FX_AVG = round(float(rate.mean()), 2)                                            # Aug YTD avg actual rate
 act["amt"] = act.apply(lambda x: x.amount_local_curr if x.local_currency == CUR else x.amount_krw / rate[x.month], axis=1)
-act["div"] = pd.to_numeric(act.cost_center, errors="coerce").map(CC_DIV).fillna(NO_CC_DIV)
+act["div"] = pd.to_numeric(act.cost_center, errors="coerce").map(CC_DIV).fillna(NO_CC_DIV) if MULTI else ENT
 act_div = {d: act[act["div"] == d].groupby("gl").amt.sum() for d in DIVS}
 
 cat = pd.concat([pd.DataFrame({"gl": pd.to_numeric(act_cat.gl_account), "c": act_cat.category}),
@@ -111,6 +133,7 @@ labor_gl = set(mode[mode == "인건비"].index.astype(int)) | HR_EXTRA
 ref = openpyxl.load_workbook(REF, data_only=True)
 bp_div = {}
 for d in DIVS:
+    if not MULTI: bp_div[d] = bp_gl; continue        # 법인 1개 시트: 26BP는 Supabase 그대로
     bp_div[d] = pd.Series({int(r[0]): (r[20] or 0) for r in ref[E["div_sheets"][d]].iter_rows(min_row=4, values_only=True)
                            if isinstance(r[0], (int, float)) and r[0] > 500000})
 chk = sum(bp_div[d].reindex(bp_gl.index).fillna(0) for d in DIVS) - bp_gl
@@ -140,16 +163,18 @@ DETAIL = {"29": "Charges", "47": "Adv"}             # majors budgeted item-by-it
 det_gls = {code: [a for c, l in chart if c == code for a in l] for code in DETAIL}
 typ_of = lambda gl, code: "HR" if (gl in labor_gl or code in LABOR_MAJORS) else DETAIL.get(code, "Input")
 
-det_items = {code: [] for code in DETAIL}
-for code, sp in E["det_src"].items():           # 26년 상세 항목 (참고용 사전 기입)
-    ov = E.get("det_gl_override", {}).get(code, {})
-    for r in ref[sp["sheet"]].iter_rows(min_row=sp["rows"][0], max_row=sp["rows"][1], values_only=True):
-        if r[sp["div"]] and r[sp["item"]] and r[sp["gl"]]:
-            det_items[code].append((r[sp["div"]], " ".join(str(r[sp["item"]]).split()),
-                                    r[sp["vendor"]] if sp["vendor"] is not None else None,
-                                    ov.get(r[sp["div"]], int(r[sp["gl"]])), r[sp["total"]] or 0))
-for code in DETAIL:
-    assert abs(sum(i[4] for i in det_items[code]) - sum(bp_gl.get(gl, 0) for gl, _, _ in det_gls[code])) < 0.01
+def _det_rows(sp):
+    """HUK: 행·열 고정(rows). 그 외: 헤더 행(hdr)에서 열 위치를 찾고 'Total' 행 전까지 읽는다."""
+    ws = ref[sp["sheet"]]
+    if "rows" in sp:
+        yield from ((sp, r) for r in ws.iter_rows(min_row=sp["rows"][0], max_row=sp["rows"][1], values_only=True)); return
+    h = [c.value for c in ws[sp["hdr"]]]
+    col = dict(div=h.index("Division") if "Division" in h else None, item=h.index("Expected events"),
+               vendor=h.index("Vendor") if "Vendor" in h else None, gl=h.index("G/L No."),
+               total=[i for i, v in enumerate(h) if v == "TOTAL"][-1])
+    for r in ws.iter_rows(min_row=sp["hdr"] + 1, values_only=True):
+        if "Total" in [str(v).strip() for v in r[:6]]: break
+        yield col, r
 
 ITEM_KR = {"IT Service Fee": "IT 서비스 비용(본사)", "Sundry": "기타 잡비", "EDI Annual Charge": "EDI 연간 사용료",
            "Waste Management": "폐기물 처리", "Annual Support": "연간 기술지원", "UK registered office": "영국 등기 사무소",
@@ -169,6 +194,55 @@ ITEM_KR = {"IT Service Fee": "IT 서비스 비용(본사)", "Sundry": "기타 �
            "PR activity": "PR 활동",
            "Other expenses ( hosting, platform fees, temp staff etc)": "기타 (호스팅, 플랫폼 수수료, 임시 인력 등)",
            "Website": "웹사이트"}
+
+ITEM_KR.update({   # 법인별 26년 항목 (한글 파일용)
+    "401k admin fee": "401k 관리 수수료", "ACA filing": "ACA(건강보험) 신고 대행", "Payroll admin fee": "급여 대행 수수료",
+    "Business license fee": "사업 라이선스 수수료", "Annual audits (1H, year-end)": "연간 회계감사 (반기, 연말)",
+    "Annual tax returns": "연간 세무신고", "Credit card annual fee": "신용카드 연회비", "customs processing fee": "통관 처리 수수료",
+    "Legal Representative Service": "법정대리인 서비스", "Liquidation HUMAX México (until we start)": "HUMAX México 청산 비용",
+    "Intermediary Bank feed for Transfers from USD to México": "USD→멕시코 송금 중개은행 수수료",
+    "Scotia Bank in USD Fee for transfers and payments": "Scotia Bank USD 송금·지급 수수료",
+    "Professional Services (Tax Returns, Invoice, Payroll services, etc)": "전문 서비스 (세무신고, 인보이스, 급여 대행 등)",
+    "IVA and ISR Tax Back collect 400K USD": "IVA·ISR 세금 환급 대행 (400K USD)",
+    "PWC Services for recover Staments and invoices of 2020": "PwC 20년 명세서·인보이스 복구 서비스",
+    "TAXES for payroll and service PwC": "급여·PwC 서비스 관련 세금", "CERTIFICATION MH01-500": "MH01-500 인증",
+    "Warehouse of CCUSAin McAllen los santos": "McAllen CCUSA 창고",
+    "Bitkom,Annual contribution fee & BDI charge": "Bitkom 연회비 및 BDI 분담금", "Bitkom GSA Garentisystem fee": "Bitkom GSA 보증시스템 수수료",
+    "Der grüne punkt, Logo using royalty": "Der Grüne Punkt 로고 사용료", "Crowe tax returns": "Crowe 세무신고",
+    "financial statements preparation & publication": "재무제표 작성·공시", "Waste management": "폐기물 처리",
+    "RLG /CCR , Annual system fee - 2026": "RLG/CCR 연간 시스템 수수료", "Accounting outsourcing": "회계 아웃소싱",
+    "Crowe tax consultants - double taxation services": "Crowe 세무자문 (이중과세)", "M2 Warehouse": "M2 창고",
+    "Orga Plan": "Orga Plan (계약 해지 수수료)", "Labour cost": "인력 비용", "HDG Office closure": "HDG 사무실 폐쇄",
+    "Painter work": "도장 작업", "Electric work": "전기 작업", "Crowe Italy": "Crowe 이탈리아", "Bank charges": "은행 수수료",
+    "Payroll services": "급여 대행", "Legal services": "법률 자문",
+    "Engineering and CS Outsourcing": "엔지니어링·CS 아웃소싱", "Consulting in Finance, Accounting, HR and Tax Services": "재무·회계·인사·세무 컨설팅",
+    "Legal Consulting Services": "법률 자문", "Accounting Software Licensing": "회계 소프트웨어 라이선스", "HBR – Archived Documents": "HBR 문서 보관",
+    "Remittance&Collection": "송금·추심 수수료", "Tax Accountant": "세무사 수수료", "JEITA Annual Fee": "JEITA 연회비",
+    "CHAdeMO Annual Fee": "CHAdeMO 연회비", "Outsourcing Costs": "외주 비용", "Corporate Cards Annual Fee": "법인카드 연회비",
+    "JAF Annual Fee": "JAF(일본자동차연맹) 연회비", "Industrial Waste Disposal Fee": "산업폐기물 처리비",
+    "Parking lot New Contract Commission": "주차장 신규 계약 수수료", "Charges-Others": "지급수수료-기타", "Cleaning Fee": "청소비",
+    "CATV Show 2026 부스 출품비용": "CATV Show 26년 부스 출품비용", "HJP Private Exhibition 2026 전시회비용": "HJP 단독 전시회 26년 비용",
+    "Audit": "회계감사", "Building maintenance fee": "건물 관리비", "Accounting service": "회계 서비스", "Annual inspection": "연간 검사",
+    "Local IT service fee": "현지 IT 서비스 비용", "Residence permit": "거류 허가 수수료", "Samples": "샘플", "Cleaning": "청소",
+    "(S&A)Professional Fee": "전문 서비스 수수료", "(S&A)Legal Fee": "법률 자문 수수료",
+})
+
+det_items = {code: [] for code in DETAIL}
+gl_desc = {gl: (en, kr) for _, l in chart for gl, en, kr in l}
+for code, sp in E["det_src"].items():           # 26년 상세 항목 (참고용 사전 기입)
+    ov = E.get("det_gl_override", {}).get(code, {})
+    if code in E.get("det_from_bp", ()):         # 26년 상세 시트를 못 쓰는 경우: 26BP 계정별 1행
+        for gl, en, kr in det_gls[code]:
+            if bp_gl.get(gl, 0): det_items[code].append((ENT, en, None, gl, float(bp_gl[gl]))); ITEM_KR.setdefault(en, kr)
+        continue
+    for c, r in _det_rows(sp):
+        div = r[c["div"]] if MULTI else ENT
+        if div and r[c["gl"]] and (r[c["item"]] or not MULTI):
+            gl = int(r[c["gl"]]); item = " ".join(str(r[c["item"]] or gl_desc[gl][0]).split())
+            det_items[code].append((div, item, r[c["vendor"]] if c["vendor"] is not None else None,
+                                    ov.get(div, gl), r[c["total"]] or 0))
+for code in DETAIL:
+    assert abs(sum(i[4] for i in det_items[code]) - sum(bp_gl.get(gl, 0) for gl, _, _ in det_gls[code])) < 0.01
 
 # ======================================================================= labels
 L = {
@@ -209,7 +283,7 @@ L = {
   ck=dict(div="Division missing", gl="G/L missing", bad="Invalid G/L", ok="OK", mis="Mismatch"),
   s_title="▣ {e} FY27 Budget Summary", s_sel="Division ▶", s_note="[{c}]  Read-only. Choose the division in the yellow cell.",
   s_heads=["Account", "Description", "FY26 BP", "FY26 Actual\n(Jan-Aug)", "FY26\nForecast", "FY27 BP", "Ratio (%)", "Diff"],
-  s_fx="Business plan FX rate (KRW / GBP) ▶", s_krw="[KRW]  = GBP × business plan FX rate (default: Jan–Aug FY26 average actual rate)",
+  s_fx="Business plan FX rate (KRW / {c}) ▶", s_krw="[KRW]  = {c} × business plan FX rate (default: Jan–Aug FY26 average actual rate)",
   s_total="TOTAL", s_chk="Check vs sheet", s_chkline="Charges / Advertisement check: ", s_okw="OK", s_ngw="MISMATCH",
   hr_note="※ Grey (HR) accounts are blank until HQ consolidates the HR form — ratios of 11/12/13/14 are not meaningful until then.",
  ),
@@ -250,9 +324,47 @@ L = {
   ck=dict(div="Division 누락", gl="계정 누락", bad="계정 오류", ok="OK", mis="불일치"),
   s_title="▣ {e} 27년 예산 요약", s_sel="Division ▶", s_note="[{c}]  읽기 전용. 노란 칸에서 Division 선택.",
   s_heads=["대계정", "영문명", "26년 BP", "26년 실적\n(1~8월)", "26년\n예상", "27년 BP", "비율(%)", "Diff"],
-  s_fx="사업계획 환율 (KRW / GBP) ▶", s_krw="[KRW]  = GBP × 사업계획 환율 (기본값: 26년 1~8월 실적 평균환율)",
+  s_fx="사업계획 환율 (KRW / {c}) ▶", s_krw="[KRW]  = {c} × 사업계획 환율 (기본값: 26년 1~8월 실적 평균환율)",
   s_total="합계", s_chk="시트 검증", s_chkline="지급수수료·광고선전비 체크: ", s_okw="OK", s_ngw="불일치",
   hr_note="※ 회색(인건비) 계정은 HR 양식 취합 전까지 공란이라, 11/12/13/14 대계정의 비율은 그 전까지 의미가 없습니다.",
+ ),
+}
+
+# CC를 나누지 않는 법인(법인 전체 입력 시트 1개)용 라벨 — L 위에 덮어쓴다. {e}=법인, {c}=통화
+L_SINGLE = {
+ "en": dict(
+  guide=[("How to fill in", None),
+   ("1. {e}", "Enter the FY27 monthly budget in the BLUE cells of the {e} sheet. Explain the basis in 'Basis / Comment'."),
+   ("2. Charges / Advertisement", "Enter every Charges (29) and Advertisement (47) item line by line: item, vendor, G/L description (drop-down), monthly amount. Amounts flow to the {e} sheet automatically (GREEN cells)."),
+   ("3. Summary", "Read-only. Check FY27 BP against the FY26 Forecast."),
+   ("", None), ("Colour legend", None),
+   ("BLUE", "Input cell (sheets that need input also have a light-blue tab)"), ("GREEN", "Do not enter — auto-filled from what you enter in the Charges / Advertisement sheets"),
+   ("GREY", "Do not enter — labour cost (salary, bonus, retirement pay, medical, scholarship etc.). HR team will collect it with a separate form."),
+   ("", None), ("Reference columns", None),
+   ("FY26 BP", "FY26 Business Plan (expatriates excluded)"),
+   ("FY26 Actual (Jan-Aug)", "Actual Jan–Aug FY26. Postings in other currencies converted to {c} at monthly actual rate."),
+   ("FY26 Forecast", "FY26 Actual (Jan-Aug) ÷ 8 × 12"),
+   ("Ratio (%) / Diff", "Ratio (%) = FY27 BP ÷ FY26 Forecast,  Diff = FY27 BP − FY26 Forecast")],
+  b_title="▣ {e}", c_sub="[{c}]  One item per line. Choose the G/L description from the drop-down list (G/L No. fills in automatically). Amounts flow to the {e} sheet.",
+  c_heads=["No", "Item (expected event)", "Vendor", "G/L No.\n(auto)", "G/L Description", "FY26 BP\n(ref.)"],
+  s_note="[{c}]  Read-only.",
+ ),
+ "ko": dict(
+  guide=[("작성 방법", None),
+   ("1. {e}", "{e} 시트의 파란 칸에 27년 월별 예산을 입력. '산정근거 / 코멘트' 열에 근거 기재."),
+   ("2. 지급수수료 / 광고선전비", "지급수수료(29)·광고선전비(47) 항목을 한 줄씩 입력: 항목, 거래처, 계정명(드롭다운), 월별 금액. 금액은 {e} 시트(초록 칸)로 자동 반영."),
+   ("3. 요약", "읽기 전용. 26년 예상 대비 27년 BP 비율 확인."),
+   ("", None), ("색상 안내", None),
+   ("파랑", "입력 칸 (입력이 필요한 시트는 시트 탭도 하늘색)"), ("초록", "입력 금지 — 지급수수료·광고선전비 시트에서 작성 시 자동 반영"),
+   ("회색", "입력 금지 — 인건비(급여, 상여, 퇴직급여, 의료보험, 자녀장학금 등). HR에서 별도 양식으로 취합."),
+   ("", None), ("참고 열 설명", None),
+   ("26년 BP", "26년 사업계획 (주재원 제외)"),
+   ("26년 실적(1~8월)", "26년 1~8월 실적. {c} 외 통화 전표는 월별 실적환율로 {c} 환산."),
+   ("26년 예상", "26년 실적(1~8월) ÷ 8 × 12"),
+   ("비율(%) / Diff", "비율(%) = 27년 BP ÷ 26년 예상,  Diff = 27년 BP − 26년 예상")],
+  b_title="▣ {e}", c_sub="[{c}]  한 줄에 한 항목. 계정명은 드롭다운에서 선택(계정코드는 자동 표시). 금액은 {e} 시트로 자동 반영.",
+  c_heads=["No", "항목 (예상 내역)", "거래처", "계정코드\n(자동)", "계정명", "26년 BP\n(참고)"],
+  s_note="[{c}]  읽기 전용.",
  ),
 }
 
@@ -279,7 +391,9 @@ def style_row(ws, row, c1, c2, font=BASE, bg=None):
         if bg: x.fill = fill(bg)
 
 def build(lang, out):
-    T = L[lang]
+    T = dict(L[lang])
+    if not MULTI: T.update(L_SINGLE[lang])
+    TOTSH = T["sh_tot"] if MULTI else ENT              # 대계정 소계를 비교·집계할 시트 (HUK: 합계 시트, 그 외: 법인 시트)
     wb = openpyxl.Workbook()
     # ------------------------------------------------ Guide
     gd = wb.active; gd.title = T["sh_guide"]; gd.sheet_view.showGridLines = False
@@ -289,26 +403,29 @@ def build(lang, out):
     leg = dict(zip(T["legend"], [BLUE_IN, GREEN, GREY]))
     for i, (k, v) in enumerate(T["guide"]):
         r = 5 + i
-        gd.cell(r, 2, k).font = BOLD if v is None else BASE
-        if v: gd.cell(r, 3, v).font = BASE; gd.cell(r, 3).alignment = Alignment(wrap_text=True, vertical="top")
+        gd.cell(r, 2, k.format(e=ENT, c=CUR)).font = BOLD if v is None else BASE
+        if v: gd.cell(r, 3, v.format(e=ENT, c=CUR)).font = BASE; gd.cell(r, 3).alignment = Alignment(wrap_text=True, vertical="top")
         if k in leg: gd.cell(r, 2).fill = fill(leg[k])
     gd.cell(5 + len(T["guide"]) + 1, 2, T["warn"]).font = Font(name="Arial", size=9, color="C00000", bold=True)
 
     # ------------------------------------------------ List (hidden)
     ls = wb.create_sheet("List")
-    ls.cell(1, 5, "Division")
     LCOL = {"29": 1, "47": 9}                         # 29 -> A:C, 47 -> I:K
     for code, c0 in LCOL.items():
         ls.cell(1, c0, f"{code} G/L No."); ls.cell(1, c0 + 1, "Description"); ls.cell(1, c0 + 2, "계정명")
         for i, (gl, en, kr) in enumerate(det_gls[code]):
             ls.cell(i + 2, c0, gl); ls.cell(i + 2, c0 + 1, en); ls.cell(i + 2, c0 + 2, kr)
-    for i, d in enumerate([T["sh_tot"]] + DIVS): ls.cell(i + 2, 5, d)
+    if MULTI:
+        ls.cell(1, 5, "Division")
+        for i, d in enumerate([T["sh_tot"]] + DIVS): ls.cell(i + 2, 5, d)
     ls.sheet_state = "hidden"
 
     # ------------------------------------------------ detail sheets: 29 Charges, 47 Advertisement (built first)
     ck = T["ck"]
-    H, CTOT, M1, CBAS = 4, 8, 9, 21
-    C_NUM = [7] + list(range(CTOT, M1 + 12))          # numeric cols: 26 ref, 27 total, Jan..Dec
+    o = 1 if MULTI else 0                             # HUK만 B열 = Division
+    H, cITEM, cVEN, cGL, cNAME, cREF = 4, 2 + o, 3 + o, 4 + o, 5 + o, 6 + o
+    CTOT, M1, CBAS = 7 + o, 8 + o, 20 + o
+    C_NUM = [cREF] + list(range(CTOT, M1 + 12))       # numeric cols: 26 ref, 27 total, Jan..Dec
     geo = {}
 
     def detail_sheet(code):
@@ -316,7 +433,7 @@ def build(lang, out):
         ch = wb.create_sheet(D["sh"])
         ch.sheet_view.showGridLines = False
         ch["A1"] = D["title"]; ch["A1"].font = TITLE
-        ch["A2"] = T["c_sub"].format(c=CUR); ch["A2"].font = BASE
+        ch["A2"] = T["c_sub"].format(c=CUR, e=ENT); ch["A2"].font = BASE
         heads = T["c_heads"] + T["c_tail"][:1] + T["mon"] + T["c_tail"][1:]
         for i, h in enumerate(heads, 1): ch.cell(H, i, h)
         hdr(ch, H, 1, len(heads))
@@ -324,34 +441,39 @@ def build(lang, out):
         c0 = LCOL[code]; LA, LN = CL(c0), CL(c0 + (1 if lang == "en" else 2))
         gl_name = {gl: (en if lang == "en" else kr) for gl, en, kr in det_gls[code]}
         items = det_items[code]
+        assert len(items) <= last - first + 1, f"{code} 26년 항목이 30행을 넘음: {len(items)}"
+        N, G = CL(cNAME), CL(cGL)
         for i in range(last - first + 1):
             r = first + i
             ch.cell(r, 1, i + 1)
             if i < len(items):
                 d, it, v, gl, ref26 = items[i]
-                ch.cell(r, 2, d); ch.cell(r, 3, ITEM_KR.get(it, it) if lang == "ko" else it); ch.cell(r, 4, v); ch.cell(r, 6, gl_name[gl]); ch.cell(r, 7, round(ref26, 2))
-            ch.cell(r, 5, f'=IF(F{r}="","",IFERROR(INDEX(List!${LA}:${LA},MATCH(F{r},List!${LN}:${LN},0)),"{ck["bad"]}"))')
+                if MULTI: ch.cell(r, 2, d)
+                ch.cell(r, cITEM, ITEM_KR.get(it, it) if lang == "ko" else it); ch.cell(r, cVEN, v); ch.cell(r, cNAME, gl_name[gl]); ch.cell(r, cREF, round(ref26, 2))
+            ch.cell(r, cGL, f'=IF({N}{r}="","",IFERROR(INDEX(List!${LA}:${LA},MATCH({N}{r},List!${LN}:${LN},0)),"{ck["bad"]}"))')
             ch.cell(r, CTOT, f"=SUM({CL(M1)}{r}:{CL(M1 + 11)}{r})")
             style_row(ch, r, 1, len(heads))
-            for c in [2, 3, 4, 6] + list(range(M1, M1 + 12)) + [CBAS]:
+            for c in ([2] if MULTI else []) + [cITEM, cVEN, cNAME] + list(range(M1, M1 + 12)) + [CBAS]:
                 ch.cell(r, c).fill = fill(BLUE_IN); ch.cell(r, c).protection = UNLOCK
             for c in C_NUM: ch.cell(r, c).number_format = NUM
         rT = last + 1
-        ch.cell(rT, 3, D["total"])
+        ch.cell(rT, cITEM, D["total"])
         for c in C_NUM: ch.cell(rT, c, f"=SUM({CL(c)}{first}:{CL(c)}{last})").number_format = NUM
         style_row(ch, rT, 1, len(heads), BOLD, TOT)
-        for j, d in enumerate(DIVS):
-            r = rT + 1 + j
-            ch.cell(r, 2, d); ch.cell(r, 3, T["c_divsub"].format(d=d))
-            for c in C_NUM:
-                ch.cell(r, c, f"=SUMIFS({CL(c)}${first}:{CL(c)}${last},$B${first}:$B${last},$B{r})").number_format = NUM
-            style_row(ch, r, 1, len(heads), BASE, SUBT)
-        rC = rT + len(DIVS) + 1                          # check: this sheet's total vs HUK Total major subtotal
-        ch.cell(rC, 3, D["check"]); style_row(ch, rC, 1, len(heads), BOLD)
-        dv = DataValidation(type="list", formula1=f"List!${LN}$2:${LN}${len(det_gls[code]) + 1}", allow_blank=True); ch.add_data_validation(dv); dv.add(f"F{first}:F{last}")
-        dvd = DataValidation(type="list", formula1=f"List!$E$3:$E${len(DIVS) + 2}", allow_blank=True); ch.add_data_validation(dvd); dvd.add(f"B{first}:B{last}")
-        for i, w in enumerate([5, 11, 40, 20, 10, 32, 11, 11] + [9.5] * 12 + [40], 1): ch.column_dimensions[CL(i)].width = w
-        ch.row_dimensions[H].height = 30; ch.freeze_panes = ch.cell(H + 1, 7)
+        if MULTI:                                         # CC별 소계 (HUK)
+            for j, d in enumerate(DIVS):
+                r = rT + 1 + j
+                ch.cell(r, 2, d); ch.cell(r, 3, T["c_divsub"].format(d=d))
+                for c in C_NUM:
+                    ch.cell(r, c, f"=SUMIFS({CL(c)}${first}:{CL(c)}${last},$B${first}:$B${last},$B{r})").number_format = NUM
+                style_row(ch, r, 1, len(heads), BASE, SUBT)
+        rC = rT + (len(DIVS) if MULTI else 0) + 1        # check: this sheet's total vs major subtotal (TOTSH)
+        ch.cell(rC, cITEM, D["check"]); style_row(ch, rC, 1, len(heads), BOLD)
+        dv = DataValidation(type="list", formula1=f"List!${LN}$2:${LN}${len(det_gls[code]) + 1}", allow_blank=True); ch.add_data_validation(dv); dv.add(f"{N}{first}:{N}{last}")
+        if MULTI:
+            dvd = DataValidation(type="list", formula1=f"List!$E$3:$E${len(DIVS) + 2}", allow_blank=True); ch.add_data_validation(dvd); dvd.add(f"B{first}:B{last}")
+        for i, w in enumerate([5] + ([11] if MULTI else []) + [40, 20, 10, 32, 11, 11] + [9.5] * 12 + [40], 1): ch.column_dimensions[CL(i)].width = w
+        ch.row_dimensions[H].height = 30; ch.freeze_panes = ch.cell(H + 1, cREF)
         geo[code] = dict(ws=ch, CH=q(D["sh"]), first=first, last=last, rT=rT, rC=rC)
 
     for code in DETAIL: detail_sheet(code)
@@ -391,7 +513,8 @@ def build(lang, out):
                         x = ws.cell(r, c)
                         if typ in ("Charges", "Adv"):
                             g = geo[code]; CH, f1, f2 = g["CH"], g["first"], g["last"]; mc = CL(M1 + c - B_M1)
-                            x.value = f'=SUMIFS({CH}!${mc}${f1}:${mc}${f2},{CH}!$B${f1}:$B${f2},"{div}",{CH}!$E${f1}:$E${f2},$B{r})'
+                            dcrit = f',{CH}!$B${f1}:$B${f2},"{div}"' if MULTI else ""
+                            x.value = f'=SUMIFS({CH}!${mc}${f1}:${mc}${f2}{dcrit},{CH}!${CL(cGL)}${f1}:${CL(cGL)}${f2},$B{r})'
                             x.fill = fill(GREEN)
                         elif typ == "HR": x.fill = fill(GREY)
                         else: x.fill = fill(BLUE_IN); x.protection = UNLOCK
@@ -427,11 +550,11 @@ def build(lang, out):
         ws.column_dimensions.group("G", "G", hidden=True, outline_level=1)   # 26 actual: grouped, collapsed
         ws.freeze_panes = "F5"
 
-    budget_sheet(T["sh_tot"], None)
+    if MULTI: budget_sheet(T["sh_tot"], None)
     for d in DIVS: budget_sheet(d, d)
     matches = []
-    for code, g in geo.items():                      # detail sheet total vs HUK Total major subtotal
-        ref_cell = f"{q(T['sh_tot'])}!{CL(B_TOT)}{sub_row[code]}"
+    for code, g in geo.items():                      # detail sheet total vs major subtotal (HUK Total / 법인 시트)
+        ref_cell = f"{q(TOTSH)}!{CL(B_TOT)}{sub_row[code]}"
         m = f"ROUND({g['CH']}!{CL(CTOT)}{g['rT']}-{ref_cell},2)=0"; matches.append(m)
         g["ws"].conditional_formatting.add(f"{CL(CTOT)}{g['rC']}", FormulaRule(formula=[f"NOT({m})"], fill=RED_FILL, font=RED_FONT))
         x = g["ws"].cell(g["rC"], CTOT, f'=IF({m},"{T["c_ok"]}","{T["c_ng"]}")'); x.alignment = Alignment(horizontal="center")
@@ -442,23 +565,25 @@ def build(lang, out):
     sm.sheet_view.showGridLines = False
     sm["A1"] = T["s_title"].format(e=ENT); sm["A1"].font = TITLE
     sm["A2"] = T["s_note"].format(c=CUR); sm["A2"].font = BASE
-    sm["B3"] = T["s_sel"]; sm["B3"].font = BOLD; sm["B3"].alignment = Alignment(horizontal="right")
-    sm["C3"] = T["sh_tot"]; sm["C3"].fill = fill(YEL); sm["C3"].font = BOLD; sm["C3"].border = BOX; sm["C3"].protection = UNLOCK
-    dvs = DataValidation(type="list", formula1=f"List!$E$2:$E${len(DIVS) + 2}", allow_blank=False); sm.add_data_validation(dvs); dvs.add("C3")
-    ls["G1"] = "sel"; ls["G2"] = f"=MATCH({q(T['sh_sum'])}!$C$3,List!$E$2:$E${len(DIVS) + 2},0)"
+    if MULTI:                                          # Division 선택 (HUK)
+        sm["B3"] = T["s_sel"]; sm["B3"].font = BOLD; sm["B3"].alignment = Alignment(horizontal="right")
+        sm["C3"] = T["sh_tot"]; sm["C3"].fill = fill(YEL); sm["C3"].font = BOLD; sm["C3"].border = BOX; sm["C3"].protection = UNLOCK
+        dvs = DataValidation(type="list", formula1=f"List!$E$2:$E${len(DIVS) + 2}", allow_blank=False); sm.add_data_validation(dvs); dvs.add("C3")
+        ls["G1"] = "sel"; ls["G2"] = f"=MATCH({q(T['sh_sum'])}!$C$3,List!$E$2:$E${len(DIVS) + 2},0)"
     SEL = "List!$G$2"
     chk_all = CH_MATCH
-    sm["E3"] = f'="{T["s_chkline"]}"&IF({chk_all},"{T["s_okw"]}","{T["s_ngw"]}")'; sm["E3"].font = BOLD
-    sm.conditional_formatting.add("E3", FormulaRule(formula=[f"NOT({chk_all})"], fill=RED_FILL, font=RED_FONT))
+    CK = "E3" if MULTI else "A3"
+    sm[CK] = f'="{T["s_chkline"]}"&IF({chk_all},"{T["s_okw"]}","{T["s_ngw"]}")'; sm[CK].font = BOLD
+    sm.conditional_formatting.add(CK, FormulaRule(formula=[f"NOT({chk_all})"], fill=RED_FILL, font=RED_FONT))
     SH = 5; NC = len(T["s_heads"])                     # A..H
     for i, h in enumerate(T["s_heads"], 1): sm.cell(SH, i, h)
     hdr(sm, SH, 1, NC)
     src = {3: "F", 4: "G", 5: "H", 6: CL(B_TOT)}
-    order = [T["sh_tot"]] + DIVS
+    order = [T["sh_tot"]] + DIVS if MULTI else [ENT]
+    choose = lambda parts: f"CHOOSE({SEL},{','.join(parts)})" if MULTI else parts[0]
 
     def pick(col, code):
-        parts = [f'SUMIFS({q(n)}!${col}${D1}:${col}${DN},{q(n)}!$A${D1}:$A${DN},"{code}")' for n in order]
-        return f"=CHOOSE({SEL},{','.join(parts)})"
+        return "=" + choose([f'SUMIFS({q(n)}!${col}${D1}:${col}${DN},{q(n)}!$A${D1}:$A${DN},"{code}")' for n in order])
 
     def finish(r, off=0, font=BASE, bg=None):
         n = lambda c: CL(c + off)
@@ -480,7 +605,7 @@ def build(lang, out):
     finish(r, 0, BOLD, TOT)
     sm.cell(r + 1, 1, T["s_chk"])
     for c, col in src.items():
-        tot_pick = f"CHOOSE({SEL},{','.join(f'{q(n)}!{col}{BT}' for n in order)})"
+        tot_pick = choose([f"{q(n)}!{col}{BT}" for n in order])
         sm.cell(r + 1, c, f'=IF(ROUND({CL(c)}{r}-{tot_pick},2)=0,"OK","{ck["mis"]}")').alignment = Alignment(horizontal="center")
     style_row(sm, r + 1, 1, NC, Font(name="Arial", size=8, italic=True, color="808080"))
     sm.cell(r + 3, 1, T["fc_note"]).font = Font(name="Arial", size=8, italic=True, color="808080")
@@ -489,9 +614,9 @@ def build(lang, out):
     # KRW table (copy of B:H) to the right, driven by the business plan FX cell
     KO = NC + 1                                        # KRW table starts after a 2-column gap
     FXC = f"${CL(2 + KO + 3)}$3"
-    sm.cell(3, 2 + KO, T["s_fx"]).font = BOLD
+    sm.cell(3, 2 + KO, T["s_fx"].format(c=CUR)).font = BOLD
     x = sm[FXC.replace("$", "")]; x.value = FX_AVG; x.number_format = "#,##0.00"; x.fill = fill(YEL); x.font = BOLD; x.border = BOX; x.protection = UNLOCK
-    sm.cell(4, 2 + KO, T["s_krw"]).font = Font(name="Arial", size=8, italic=True, color="808080")
+    sm.cell(4, 2 + KO, T["s_krw"].format(c=CUR)).font = Font(name="Arial", size=8, italic=True, color="808080")
     for i, h in enumerate(T["s_heads"][1:], 2): sm.cell(SH, i + KO, h)
     hdr(sm, SH, 2 + KO, NC + KO)
     for r in range(SH + 1, ST + 1):
@@ -509,7 +634,7 @@ def build(lang, out):
 
     # ------------------------------------------------ order, protection, print
     det_names = [T["det"][code]["sh"] for code in DETAIL]
-    order_names = [T["sh_guide"], T["sh_sum"], T["sh_tot"]] + DIVS + det_names + ["List"]
+    order_names = [T["sh_guide"], T["sh_sum"]] + ([T["sh_tot"]] if MULTI else []) + DIVS + det_names + ["List"]
     wb._sheets = [wb[n] for n in order_names]
     for n in DIVS + det_names: wb[n].sheet_properties.tabColor = BLUE_IN      # input sheets
     wb[T["sh_guide"]].sheet_properties.tabColor = "000000"                         # guide = black tab
