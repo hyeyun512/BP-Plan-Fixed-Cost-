@@ -1,0 +1,18 @@
+# 예산 데이터·메일은 공개 저장소에 올리지 않는다
+*.xlsx
+*.XLSX
+*.xls
+*.xlsm
+*.msg
+작년 최종 예산/
+작년 요청메일/
+~$*
+
+# 비밀값
+env
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
