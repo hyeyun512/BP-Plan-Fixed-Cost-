@@ -27,6 +27,9 @@ ACT_TABLE = "26년 실적_8월 누계_260922"
 # service role 키: 환경변수 SUPABASE_SERVICE_ROLE_KEY 우선, 없으면 아래 env 파일의 SERVICE_ROLE_KEY
 # (두 테이블에 RLS 읽기 정책이 없어 anon 키로는 읽을 수 없음)
 ENV_FILE = r"C:\Users\hyju\Desktop\클로드_고정비\Supabase 업로드용\env"
+# 요약 KRW 표 환산 환율 (KRW / 통화) — 26년 3분기 평균환율 (사용자 제공). 요청용 임시값이며, 실제 사업계획 환율은 회신 취합 시 적용
+FX_KRW = {"USD": 1400.86, "EUR": 1617.25, "AUD": 992.62, "GBP": 1888.07, "BRL": 273.77, "AED": 381.42, "JPY": 8.85,
+          "CNY": 208.08, "THB": 42.18, "INR": 14.68, "TRY": 29.20, "PLN": 374.41, "HKD": 178.62}
 ACT_M = 8                            # actual months (Jan-Aug); 26 forecast = actual / ACT_M * 12
 HR_EXTRA = {531030, 531210}          # scholarship / saving schemes : HR per 26 Notes (사용자 확정)
 LABOR_MAJORS = {"11", "12", "13"}
@@ -45,7 +48,7 @@ ENTITIES = {
         det_src={"29": dict(sheet="Charges", rows=(9, 35), div=1, item=2, vendor=3, gl=4, total=23),
                  "47": dict(sheet="Promotion&Advertisement", rows=(9, 31), div=1, item=2, vendor=None, gl=3, total=22)},
         det_gl_override={"47": {"H-Direct": 535680}},               # 26BP는 H-Direct 광고비를 535680으로 계상
-        langs=["en", "ko"],                                         # HUK만 영문(배포용) + 한글(검토용)
+        langs=["en"],                                               # 영문 배포용만 (한글 검토용은 사용자가 삭제)
     ),
 }
 
@@ -58,13 +61,25 @@ def _single(ent, cur, ref_glob, chart_end=117, sh_major=None, **kw):
 ENTITIES.update({
     "HUS": _single("HUS", "USD", "1. HUS_*2026Y_Final.xlsx"),
     "HMX": _single("HMX", "USD", "2. HMX_*2026Y_Final.xlsx"),      # 26BP USD, 실적 MXN → 월별 USD 실적환율로 환산 (사용자 확정)
-    "HDG": _single("HDG", "EUR", "4. HDG_*2026Y_Final.XLSX", sh_major="0.HDG(EUR)"),
+    "HDG": _single("HDG", "EUR", "4. HDG_*2026Y_Final.XLSX", sh_major="0.HDG(EUR)", langs=["en"]),   # 영문 배포용만 (사용자 요청)
     "HUG": _single("HUG", "AED", "5. HUG_*2026Y_Final.xlsx", det_from_bp={"29"}),   # 26년 Charges 시트가 26BP와 불일치 → 26BP 계정별 참고 행 (사용자 확정)
-    "HBR": _single("HBR", "BRL", "7. HBR_*2026Y_Final.xlsx", chart_end=133),
+    "HBR": _single("HBR", "BRL", "7. HBR_*2026Y_Final.xlsx", chart_end=133, langs=["en"]),   # 영문 배포용 (사용자 요청)
     "HJP": _single("HJP", "JPY", "8. HJP_*2026Y_Final*.xlsx"),
-    "HID": _single("HID", "INR", "11. HID_*2026Y_Final.xlsx"),
+    "HID": _single("HID", "INR", "11. HID_*2026Y_Final.xlsx", langs=["en"]),   # 영문 배포용 (사용자 요청)
     "HSZ": _single("HSZ", "CNY", "12. HSZ_*2026Y_Final.xlsx"),
 })
+# 출력 파일명 — 사용자가 넘버링·담당자를 넣어 확정한 이름. 바꾸지 않는다.
+OUT_NAMES = {
+    "HUK": "1. HUK_Michael_2027Y Budget Planning.xlsx",
+    "HDG": "2. HDG_Michael_2027Y Budget Planning.xlsx",
+    "HUS": "3. HUS_성기혁 법인장님_27년 예산편성.xlsx",
+    "HJP": "4. HJP_염현준 법인장님_27년 예산편성.xlsx",
+    "HUG": "5. HUG_심재현 실장님_27년 예산편성.xlsx",
+    "HSZ": "6. HSZ_이두형 법인장님_27년 예산편성.xlsx",
+    "HBR": "7. HBR_Ciro_2027Y Budget Planning.xlsx",
+    "HMX": "8. HMX_Adrian_27년 예산편성.xlsx",
+    "HID": "9. HID_Manoj Bansal_2027Y Budget Planning.xlsx",
+}
 ENT = sys.argv[1] if len(sys.argv) > 1 else "HUK"
 LANGS = ENTITIES[ENT].get("langs", ["ko"]) if ENT in ENTITIES else ["ko"]   # 기본은 한글판만
 OUT_DIR = sys.argv[2] if len(sys.argv) > 2 else ROOT
@@ -120,7 +135,7 @@ act["gl"] = pd.to_numeric(act.gl_account)
 g = act[act.local_currency == CUR]
 if g.empty: g = act_cat[act_cat.local_currency == CUR]   # HMX: 현지통화(MXN) ≠ 예산통화(USD) → 전 법인 USD 전표로 환율 산출
 rate = g.groupby("month").amount_krw.sum() / g.groupby("month").amount_local_curr.sum()     # KRW per CUR, monthly
-FX_AVG = round(float(rate.mean()), 2)                                            # Aug YTD avg actual rate
+FX_AVG = FX_KRW[CUR]                             # 요약 KRW 표 환산 환율 (26년 3분기 평균, 임시)
 act["amt"] = act.apply(lambda x: x.amount_local_curr if x.local_currency == CUR else x.amount_krw / rate[x.month], axis=1)
 act["div"] = pd.to_numeric(act.cost_center, errors="coerce").map(CC_DIV).fillna(NO_CC_DIV) if MULTI else ENT
 act_div = {d: act[act["div"] == d].groupby("gl").amt.sum() for d in DIVS}
@@ -227,6 +242,8 @@ ITEM_KR.update({   # 법인별 26년 항목 (한글 파일용)
     "(S&A)Professional Fee": "전문 서비스 수수료", "(S&A)Legal Fee": "법률 자문 수수료",
 })
 
+ITEM_EN = {"회계감사수수료(연1회)": "Audit fee (annual)"}   # 원문이 한글인 26년 항목 (영문 파일용)
+
 det_items = {code: [] for code in DETAIL}
 gl_desc = {gl: (en, kr) for _, l in chart for gl, en, kr in l}
 for code, sp in E["det_src"].items():           # 26년 상세 항목 (참고용 사전 기입)
@@ -283,7 +300,7 @@ L = {
   ck=dict(div="Division missing", gl="G/L missing", bad="Invalid G/L", ok="OK", mis="Mismatch"),
   s_title="▣ {e} FY27 Budget Summary", s_sel="Division ▶", s_note="[{c}]  Read-only. Choose the division in the yellow cell.",
   s_heads=["Account", "Description", "FY26 BP", "FY26 Actual\n(Jan-Aug)", "FY26\nForecast", "FY27 BP", "Ratio (%)", "Diff"],
-  s_fx="Business plan FX rate (KRW / {c}) ▶", s_krw="[KRW]  = {c} × business plan FX rate (default: Jan–Aug FY26 average actual rate)",
+  s_fx="KRW conversion rate (KRW / {c}) ▶", s_krw="[KRW]  = {c} × KRW conversion rate (provisional: FY26 Q3 average rate)",
   s_total="TOTAL", s_chk="Check vs sheet", s_chkline="Charges / Advertisement check: ", s_okw="OK", s_ngw="MISMATCH",
   hr_note="※ Grey (HR) accounts are blank until HQ consolidates the HR form — ratios of 11/12/13/14 are not meaningful until then.",
  ),
@@ -324,7 +341,7 @@ L = {
   ck=dict(div="Division 누락", gl="계정 누락", bad="계정 오류", ok="OK", mis="불일치"),
   s_title="▣ {e} 27년 예산 요약", s_sel="Division ▶", s_note="[{c}]  읽기 전용. 노란 칸에서 Division 선택.",
   s_heads=["대계정", "영문명", "26년 BP", "26년 실적\n(1~8월)", "26년\n예상", "27년 BP", "비율(%)", "Diff"],
-  s_fx="사업계획 환율 (KRW / {c}) ▶", s_krw="[KRW]  = {c} × 사업계획 환율 (기본값: 26년 1~8월 실적 평균환율)",
+  s_fx="KRW 환산 환율 (KRW / {c}) ▶", s_krw="[KRW]  = {c} × KRW 환산 환율 (임시: 26년 3분기 평균환율)",
   s_total="합계", s_chk="시트 검증", s_chkline="지급수수료·광고선전비 체크: ", s_okw="OK", s_ngw="불일치",
   hr_note="※ 회색(인건비) 계정은 HR 양식 취합 전까지 공란이라, 11/12/13/14 대계정의 비율은 그 전까지 의미가 없습니다.",
  ),
@@ -449,7 +466,7 @@ def build(lang, out):
             if i < len(items):
                 d, it, v, gl, ref26 = items[i]
                 if MULTI: ch.cell(r, 2, d)
-                ch.cell(r, cITEM, ITEM_KR.get(it, it) if lang == "ko" else it); ch.cell(r, cVEN, v); ch.cell(r, cNAME, gl_name[gl]); ch.cell(r, cREF, round(ref26, 2))
+                ch.cell(r, cITEM, ITEM_KR.get(it, it) if lang == "ko" else ITEM_EN.get(it, it)); ch.cell(r, cVEN, v); ch.cell(r, cNAME, gl_name[gl]); ch.cell(r, cREF, round(ref26, 2))
             ch.cell(r, cGL, f'=IF({N}{r}="","",IFERROR(INDEX(List!${LA}:${LA},MATCH({N}{r},List!${LN}:${LN},0)),"{ck["bad"]}"))')
             ch.cell(r, CTOT, f"=SUM({CL(M1)}{r}:{CL(M1 + 11)}{r})")
             style_row(ch, r, 1, len(heads))
@@ -660,11 +677,10 @@ def build(lang, out):
     return dict(D1=D1, DN=DN, BT=BT, sub29=sub_row["29"], sub47=sub_row["47"], **{f"{c}_{k}": v for c, g in geo.items() for k, v in g.items() if k != "ws"})
 
 if __name__ == "__main__":
-    if LANGS == ["en", "ko"]:   # HUK: 영문 배포용 + 한글 검토용
-        info = build("en", os.path.join(OUT_DIR, f"{ENT}_2027Y Budget Planning.xlsx"))
-        build("ko", os.path.join(OUT_DIR, f"{ENT}_2027Y Budget Planning_한글(검토용).xlsx"))
-    else:                       # 기본: 한글판 1개
-        info = build("ko", os.path.join(OUT_DIR, f"{ENT}_27년 예산편성.xlsx"))
+    name = OUT_NAMES.get(ENT, f"{ENT}_27년 예산편성.xlsx" if LANGS[0] == "ko" else f"{ENT}_2027Y Budget Planning.xlsx")
+    info = build(LANGS[0], os.path.join(OUT_DIR, name))         # 배포용 1개 (HUK·HDG 영문, 그 외 한글)
+    if LANGS[1:] == ["ko"]:                                     # 요청 시에만: 한글 검토용 추가
+        build("ko", os.path.join(OUT_DIR, name.replace(".xlsx", "_한글(검토용).xlsx")))
     print(info)
     for d in DIVS: print(d, "BP", round(bp_div[d].sum(), 1), "ACT", round(act_div[d].sum(), 1))
     print("BP total", round(bp_gl.sum(), 1), "ACT total", round(act.amt.sum(), 1), "missing-from-chart", missing)
